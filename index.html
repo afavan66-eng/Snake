@@ -1,200 +1,202 @@
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Snake Online 🐍</title>
+import sqlite3
+import requests
+import json
+import logging
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
-<style>
-body{
-  margin:0;
-  font-family:system-ui;
-  background:#0f1220;
-  color:#fff;
-  display:flex;
-  flex-direction:column;
-  align-items:center
-}
-h1{margin:12px 0}
-canvas{
-  background:#111;
-  border:2px solid #3cff00;
-  touch-action:none
-}
-.panel{
-  display:flex;
-  gap:10px;
-  margin:8px 0;
-  flex-wrap:wrap;
-  justify-content:center
-}
-input{
-  padding:10px;
-  border-radius:8px;
-  border:none
-}
-button{
-  padding:10px 14px;
-  border:none;
-  border-radius:8px;
-  background:#3cff00;
-  color:#000;
-  font-weight:700
-}
-.scores{
-  width:95%;
-  max-width:420px;
-  background:#15192e;
-  border-radius:12px;
-  padding:10px
-}
-</style>
-</head>
+# Termux loglama
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-<body>
-<h1>Snake Online 🐍</h1>
+# --- AYARLAR ---
+TOKEN = "8515085006:AAHXt2yp7cg7DxljLMoAX4FOpw4b_QiwCOk"
+ADMIN_ID = 7234980007 
+GRUP_ID = -1002160504318 
+GRUP_LINK = "https://t.me/HILE_WROX"
+BASE_URL = "https://punisher.alwaysdata.net/apiservices"
+SULALE_URL = "https://arastir.sbs/api/sulale.php"
+ADRES_URL = "https://arastir.sbs/api/adres.php"
+GSMTC_URL = "https://arastir.sbs/api/gsmtc.php"
 
-<div class="panel">
-  <input id="username" placeholder="Kullanıcı adı" maxlength="12">
-  <button id="start">Başlat</button>
-  <button id="music">Müzik</button>
-</div>
+# Durumlar
+AD, SOYAD, IL, TEK_VERI = range(4)
 
-<canvas id="game" width="320" height="320"></canvas>
+# --- VERİTABANI İŞLEMLERİ ---
+def init_db():
+    conn = sqlite3.connect('hile_wrox.db')
+    conn.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, status TEXT)')
+    conn.commit(); conn.close()
 
-<div class="scores">
-  <h3>🏆 En İyi Skorlar</h3>
-  <ol id="leaderboard"></ol>
-</div>
+def get_status(user_id):
+    if user_id == ADMIN_ID: return "Admin"
+    conn = sqlite3.connect('hile_wrox.db')
+    res = conn.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return res[0] if res else "Freemium"
 
-<audio id="bgm" loop>
-  <source src="https://cdn.pixabay.com/download/audio/2022/10/03/audio_0f8a7d9d44.mp3?filename=arcade-113104.mp3">
-</audio>
+def set_status(user_id, status):
+    conn = sqlite3.connect('hile_wrox.db')
+    conn.execute("INSERT OR REPLACE INTO users (user_id, status) VALUES (?, ?)", (user_id, status))
+    conn.commit(); conn.close()
 
-<script type="module">
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-import {
-  getFirestore, collection, addDoc,
-  query, where, getDocs,
-  orderBy, limit
-} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+# --- KANAL KONTROLÜ ---
+async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid == ADMIN_ID: return True
+    try:
+        member = await context.bot.get_chat_member(chat_id=GRUP_ID, user_id=uid)
+        if member.status in ["member", "administrator", "creator"]: return True
+    except: pass
+    kb = [[InlineKeyboardButton("📢 Kanala Katıl", url=GRUP_LINK)]]
+    msg = "⚠️ <b>Hata:</b> Sorgu yapabilmek için kanalımıza katılmalısın!"
+    if update.callback_query: await update.callback_query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else: await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return False
 
-/* 🔐 Firebase Config */
-const firebaseConfig = {
-  apiKey: "AIzaSyBOK4La1lZ8uL5iFikZN8d8agYgAV-BO6k",
-  authDomain: "snake-793c9.firebaseapp.com",
-  projectId: "snake-793c9",
-  storageBucket: "snake-793c9.firebasestorage.app",
-  messagingSenderId: "578303841065",
-  appId: "1:578303841065:web:1db7cf42d209c4592fdd38"
-};
+# --- ADMIN KOMUTLARI ---
+async def toplu_mesaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    mesaj = " ".join(context.args)
+    if not mesaj:
+        await update.message.reply_text("❌ Kullanım: <code>/duyuru [Mesaj]</code>", parse_mode=ParseMode.HTML); return
+    conn = sqlite3.connect('hile_wrox.db'); users = conn.execute("SELECT user_id FROM users").fetchall(); conn.close()
+    basarili, hatali = 0, 0
+    wait = await update.message.reply_text(f"⏳ {len(users)} kişiye gönderiliyor...")
+    for user in users:
+        try:
+            await context.bot.send_message(chat_id=user[0], text=f"📢 <b>DUYURU</b>\n\n{mesaj}", parse_mode=ParseMode.HTML)
+            basarili += 1; await asyncio.sleep(0.05)
+        except: hatali += 1
+    await wait.edit_text(f"✅ Tamamlandı!\n🟢 Başarılı: {basarili}\n🔴 Başarısız: {hatali}", parse_mode=ParseMode.HTML)
 
-const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
+async def kullanici_listesi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    conn = sqlite3.connect('hile_wrox.db'); users = conn.execute("SELECT user_id, status FROM users").fetchall(); conn.close()
+    text = "👥 <b>KULLANICI LİSTESİ</b>\n\n"
+    for uid, status in users: text += f"▫️ <code>{uid}</code> - <b>{status}</b>\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-/* ==== GAME ==== */
-const canvas = document.getElementById("game");
-const ctx = canvas.getContext("2d");
-const size = 16;
-let snake, dir, food, score, loop;
+async def vip_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    try:
+        uid = int(context.args[0]); set_status(uid, "VIP")
+        await update.message.reply_text(f"✅ {uid} artık <b>VIP</b>.", parse_mode=ParseMode.HTML)
+    except: await update.message.reply_text("Kullanım: /vipver ID")
 
-const usernameInput = document.getElementById("username");
+async def vip_al(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    try:
+        uid = int(context.args[0]); set_status(uid, "Freemium")
+        await update.message.reply_text(f"🗑 {uid} artık <b>Freemium</b>.", parse_mode=ParseMode.HTML)
+    except: await update.message.reply_text("Kullanım: /vipal ID")
 
-function reset(){
-  snake=[{x:10,y:10}];
-  dir={x:1,y:0};
-  food={x:5,y:5};
-  score=0;
-}
+# --- API VE FORMAT ---
+def format_output(api_text):
+    try:
+        data = json.loads(api_text)
+        if not data: return "❌ Kayıt bulunamadı."
+        results = data if isinstance(data, list) else (data.get("results") or data.get("data") or [data])
+        output = "<b>📝 SONUÇ</b>\n──────────────────────\n"
+        for item in results[:15]:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if v and k.lower() not in ["success", "status", "message"]:
+                        output += f"▫️ <b>{str(k).upper()}</b>: {v}\n"
+            output += "──────────────────────\n"
+        return output
+    except: return f"🔍 <b>Sonuç:</b>\n\n<code>{api_text}</code>"
 
-function draw(){
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  ctx.fillStyle="#3cff00";
-  snake.forEach(p=>ctx.fillRect(p.x*size,p.y*size,size,size));
-  ctx.fillStyle="#ff3c3c";
-  ctx.fillRect(food.x*size,food.y*size,size,size);
-}
+# --- MENÜ VE BUTONLAR ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_db()
+    uid = update.effective_user.id
+    if get_status(uid) == "Freemium": set_status(uid, "Freemium")
+    kb = [[InlineKeyboardButton("🆓 Ücretsiz", callback_data='f')], [InlineKeyboardButton("💎 VIP", callback_data='v')]]
+    text = f"💠 <b>@HILE_WROX PANEL</b>\n👑 Statü: <b>{get_status(uid)}</b>"
+    if update.message: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
 
-function step(){
-  const h={x:snake[0].x+dir.x,y:snake[0].y+dir.y};
-  if(h.x<0||h.y<0||h.x>=20||h.y>=20||snake.some((p,i)=>i&&p.x===h.x&&p.y===h.y)){
-    gameOver();return;
-  }
-  snake.unshift(h);
-  if(h.x===food.x&&h.y===food.y){
-    score++;
-    food={x:Math.floor(Math.random()*20),y:Math.floor(Math.random()*20)};
-  } else snake.pop();
-  draw();
-}
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if not await check_subscription(update, context): return ConversationHandler.END
+    if q.data == 'ana_menu': return await start(update, context)
+    
+    if q.data == 'f':
+        kb = [
+            [InlineKeyboardButton("TC", callback_data='api_tc')], 
+            [InlineKeyboardButton("Ad Soyad", callback_data='api_adsoyad')], 
+            [InlineKeyboardButton("GSM-TC", callback_data='api_gsmtc')],
+            [InlineKeyboardButton("🔙 Geri", callback_data='ana_menu')]
+        ]
+        await q.edit_message_text("🆓 <b>Ücretsiz Sorgular:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML); return
+    
+    elif q.data == 'v':
+        if get_status(q.from_user.id) not in ["VIP", "Admin"]:
+            await q.message.reply_text("🚫 VIP Gerekli."); return
+        # OKUL NO TEKRAR VIP'E EKLENDİ
+        kb = [
+            [InlineKeyboardButton("TC PRO", callback_data='api_tcpro')], 
+            [InlineKeyboardButton("Ad Soyad İl PRO", callback_data='api_adsoyadpro')], 
+            [InlineKeyboardButton("Sülale", callback_data='api_sulale')], 
+            [InlineKeyboardButton("Adres", callback_data='api_adres')], 
+            [InlineKeyboardButton("Okul No", callback_data='api_okulno')], 
+            [InlineKeyboardButton("🔙 Geri", callback_data='ana_menu')]
+        ]
+        await q.edit_message_text("💎 <b>VIP Sorgular:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML); return
+    
+    context.user_data['op'] = q.data
+    if q.data in ['api_adsoyad', 'api_adsoyadpro']:
+        await q.message.reply_text("👤 <b>İsim Girin:</b>", parse_mode=ParseMode.HTML); return AD
+    elif q.data == 'api_gsmtc':
+        await q.message.reply_text("📞 <b>Telefon Girin:</b>", parse_mode=ParseMode.HTML); return TEK_VERI
+    else:
+        await q.message.reply_text("🆔 <b>TC Girin:</b>", parse_mode=ParseMode.HTML); return TEK_VERI
 
-/* ==== USERNAME CHECK ==== */
-async function usernameExists(name){
-  const q=query(collection(db,"scores"), where("username","==",name));
-  const snap=await getDocs(q);
-  return !snap.empty;
-}
+# --- VERİ TOPLAMA ---
+async def get_ad(u, c): c.user_data['ad'] = u.message.text; await u.message.reply_text("👤 <b>Soyad Girin:</b>", parse_mode=ParseMode.HTML); return SOYAD
+async def get_soyad(u, c):
+    c.user_data['soyad'] = u.message.text
+    if c.user_data['op'] == 'api_adsoyadpro': await u.message.reply_text("🏙️ <b>İl Girin:</b>", parse_mode=ParseMode.HTML); return IL
+    return await execute_api(u, c)
+async def get_il(u, c): c.user_data['il'] = u.message.text; return await execute_api(u, c)
+async def get_single(u, c): c.user_data['val'] = u.message.text; return await execute_api(u, c)
 
-/* ==== START ==== */
-async function startGame(){
-  const name=usernameInput.value.trim();
-  if(!name){
-    alert("Kullanıcı adı zorunlu!");
-    return;
-  }
-  if(await usernameExists(name)){
-    alert("Bu kullanıcı adı zaten alınmış!");
-    return;
-  }
-  reset();
-  draw();
-  clearInterval(loop);
-  loop=setInterval(step,120);
-}
+async def execute_api(update, context):
+    op = context.user_data.get('op')
+    wait = await update.message.reply_text("⏳")
+    try:
+        if op == 'api_sulale': url, p = SULALE_URL, {'tc': context.user_data['val']}
+        elif op == 'api_adres': url, p = ADRES_URL, {'tc': context.user_data['val']}
+        elif op == 'api_gsmtc': url, p = GSMTC_URL, {'gsm': context.user_data['val']}
+        else:
+            url = f"{BASE_URL}/{op.replace('api_','')}.php"
+            p = {'ad': context.user_data.get('ad'), 'soyad': context.user_data.get('soyad'), 'il': context.user_data.get('il'), 'tc': context.user_data.get('val')}
+        r = requests.get(url, params=p, timeout=25)
+        await wait.edit_text(format_output(r.text), parse_mode=ParseMode.HTML)
+    except: await wait.edit_text("❌ Hata oluştu.")
+    await start(update, context); return ConversationHandler.END
 
-/* ==== GAME OVER ==== */
-async function gameOver(){
-  clearInterval(loop);
-  await addDoc(collection(db,"scores"),{
-    username: usernameInput.value.trim(),
-    score: score,
-    at: Date.now()
-  });
-  await loadScores();
-  alert("Oyun bitti! Skor: "+score);
-}
-
-/* ==== LEADERBOARD ==== */
-async function loadScores(){
-  const q=query(
-    collection(db,"scores"),
-    orderBy("score","desc"),
-    limit(10)
-  );
-  const snap=await getDocs(q);
-  const ol=document.getElementById("leaderboard");
-  ol.innerHTML="";
-  snap.forEach(d=>{
-    const li=document.createElement("li");
-    li.textContent=`${d.data().username} — ${d.data().score}`;
-    ol.appendChild(li);
-  });
-}
-
-/* ==== CONTROLS ==== */
-window.addEventListener("keydown",e=>{
-  if(e.key==="ArrowUp"&&dir.y!==1)dir={x:0,y:-1};
-  if(e.key==="ArrowDown"&&dir.y!==-1)dir={x:0,y:1};
-  if(e.key==="ArrowLeft"&&dir.x!==1)dir={x:-1,y:0};
-  if(e.key==="ArrowRight"&&dir.x!==-1)dir={x:1,y:0};
-});
-
-/* ==== UI ==== */
-document.getElementById("start").onclick=startGame;
-const bgm=document.getElementById("bgm");
-document.getElementById("music").onclick=()=>bgm.paused?bgm.play():bgm.pause();
-
-loadScores();
-</script>
-</body>
-</html>
+# --- ANA DÖNGÜ ---
+if __name__ == '__main__':
+    init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(handle_buttons)],
+        states={
+            AD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_ad)],
+            SOYAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_soyad)],
+            IL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_il)],
+            TEK_VERI: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_single)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("duyuru", toplu_mesaj))
+    app.add_handler(CommandHandler("kullanicilar", kullanici_listesi))
+    app.add_handler(CommandHandler("vipver", vip_ver))
+    app.add_handler(CommandHandler("vipal", vip_al))
+    app.add_handler(conv)
+    app.run_polling()
